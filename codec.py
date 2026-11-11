@@ -21,6 +21,7 @@ from milky.models import (
     IncomingMessage,
     MentionAllSegmentData,
     MentionSegmentData,
+    MessageScene,
     OutgoingFaceSegment,
     OutgoingForwardedMessage,
     OutgoingForwardSegment,
@@ -122,6 +123,15 @@ class MilkyCodec:
 
     def __init__(self, logger: Any) -> None:
         self._logger = logger
+        self.private_file_hashes: Dict[Tuple[str, str], str] = {}
+
+    def remember_private_file_hash(self, user_id: str, file_id: str, file_hash: str) -> None:
+        if not user_id or not file_id or not file_hash:
+            return
+        if len(self.private_file_hashes) >= 2000:
+            oldest_key = next(iter(self.private_file_hashes))
+            self.private_file_hashes.pop(oldest_key, None)
+        self.private_file_hashes[(user_id, file_id)] = file_hash
 
     async def decode_inbound_message(
         self,
@@ -225,6 +235,7 @@ class MilkyCodec:
         account_id: str,
         scene: str,
         peer_id: str,
+        resolve_nested: bool = True,
     ) -> Tuple[List[Dict[str, Any]], bool, bool, bool]:
         converted: List[Dict[str, Any]] = []
         is_at = False
@@ -276,6 +287,8 @@ class MilkyCodec:
 
             if seg_type == "reply":
                 reply_seq = segment.data.message_seq
+                if not reply_seq:
+                    continue
                 target_msg_id = build_message_id(scene, peer_id, reply_seq)
                 reply_payload: Dict[str, Any] = {"target_message_id": target_msg_id}
                 sender_id = str(raw_data.get("sender_id") or "").strip()
@@ -297,9 +310,31 @@ class MilkyCodec:
                             quote_texts.append(f"@{qdata.get('name') or qdata.get('user_id') or ''} ")
                     if quote_texts:
                         reply_payload["target_message_content"] = "".join(quote_texts).strip()
+                elif resolve_nested and scene in {"group", "friend", "temp"} and peer_id.isdigit():
+                    try:
+                        quoted_msg = await client.get_message(MessageScene(scene), int(peer_id), int(reply_seq))
+                        reply_payload.setdefault("target_message_sender_id", str(quoted_msg.sender_id))
+                        if isinstance(quoted_msg, GroupMessage):
+                            reply_payload.setdefault("target_message_sender_nickname", quoted_msg.group_member.nickname or None)
+                            reply_payload["target_message_sender_cardname"] = quoted_msg.group_member.card.strip() or None
+                        elif isinstance(quoted_msg, FriendMessage):
+                            reply_payload.setdefault("target_message_sender_nickname", quoted_msg.friend.nickname or None)
+                        q_segs, _, _, _ = await self._decode_segments(
+                            quoted_msg.segments,
+                            [],
+                            client=client,
+                            http_client=http_client,
+                            account_id=account_id,
+                            scene=scene,
+                            peer_id=peer_id,
+                            resolve_nested=False,
+                        )
+                        if q_segs:
+                            reply_payload["target_message_content"] = self.build_plain_text(q_segs)
+                    except Exception as exc:
+                        self._logger.debug("查询 Milky 被引用消息详情失败: seq=%s error=%s", reply_seq, exc)
                 converted.append({"type": "reply", "data": reply_payload})
                 continue
-
             if seg_type == "image":
                 target_type = "emoji" if segment.data.sub_type == ImageSubType.STICKER else "image"
                 media_seg = await self._download_media_segment(
@@ -326,16 +361,10 @@ class MilkyCodec:
                 )
                 converted.append(media_seg)
                 continue
-
             if seg_type == "video":
-                media_seg = await self._download_media_segment(
-                    "video",
-                    resource_id=segment.data.resource_id,
-                    temp_url=segment.data.temp_url,
-                    client=client,
-                    http_client=http_client,
-                )
-                converted.append(media_seg)
+                duration = getattr(segment.data, "duration", 0)
+                label = f"[视频] 时长: {duration}s" if duration else "[视频]"
+                converted.append({"type": "text", "data": label})
                 continue
 
             if seg_type == "market_face":
@@ -352,22 +381,31 @@ class MilkyCodec:
                 continue
 
             if seg_type == "file":
+                file_hash = str(segment.data.file_hash or "").strip()
+                if scene != "group" and file_hash:
+                    self.remember_private_file_hash(peer_id, segment.data.file_id, file_hash)
                 converted.append({
                     "type": "file",
                     "data": {
-                        "name": segment.data.file_name,
-                        "size": str(segment.data.file_size),
+                        "name": segment.data.file_name or "附件",
+                        "size": segment.data.file_size,
                         "file_id": segment.data.file_id,
-                        "file_hash": segment.data.file_hash or "",
+                        "busid": 0,
                     },
                 })
                 continue
 
             if seg_type == "forward":
-                converted.append({
-                    "type": "forward",
-                    "data": {"forward_id": segment.data.forward_id},
-                })
+                forward_seg = await self._build_inbound_forward_segment(
+                    segment.data.forward_id,
+                    client=client,
+                    http_client=http_client,
+                    account_id=account_id,
+                    scene=scene,
+                    peer_id=peer_id,
+                    resolve_nested=resolve_nested,
+                )
+                converted.append(forward_seg)
                 continue
 
             if seg_type == "light_app":
@@ -379,6 +417,51 @@ class MilkyCodec:
                 continue
 
         return converted, is_at, is_picture, is_emoji
+    async def _build_inbound_forward_segment(
+        self,
+        forward_id: str,
+        *,
+        client: AsyncMilkyClient,
+        http_client: httpx.AsyncClient,
+        account_id: str,
+        scene: str,
+        peer_id: str,
+        resolve_nested: bool,
+    ) -> Dict[str, Any]:
+        """通过 ``get_forwarded_messages`` 将 Milky 合并转发转换为 MaiBot 标准 ``ForwardComponent`` 节点列表。"""
+        if not forward_id or not resolve_nested:
+            return {"type": "text", "data": "[forward]"}
+        try:
+            forwarded_list = await client.get_forwarded_messages(forward_id)
+        except Exception as exc:
+            self._logger.debug("获取 Milky 合并转发详情失败: forward_id=%s error=%s", forward_id, exc)
+            return {"type": "text", "data": "[forward]"}
+        if not forwarded_list:
+            return {"type": "text", "data": "[forward]"}
+
+        nodes: List[Dict[str, Any]] = []
+        for idx, item in enumerate(forwarded_list):
+            child_segs, _, _, _ = await self._decode_segments(
+                item.segments,
+                [],
+                client=client,
+                http_client=http_client,
+                account_id=account_id,
+                scene=scene,
+                peer_id=peer_id,
+                resolve_nested=False,
+            )
+            nodes.append({
+                "user_id": None,
+                "user_nickname": item.sender_name or "QQ用户",
+                "user_cardname": None,
+                "message_id": f"{forward_id}-{idx}",
+                "content": child_segs or [{"type": "text", "data": "[empty]"}],
+            })
+        if not nodes:
+            return {"type": "text", "data": "[forward]"}
+        return {"type": "forward", "data": nodes}
+
 
     async def _download_media_segment(
         self,
@@ -423,15 +506,27 @@ class MilkyCodec:
         for item in raw_message:
             if not isinstance(item, Mapping):
                 continue
-            if str(item.get("type") or "").strip() == "file":
-                uri = self._extract_media_uri(item)
-                data = item.get("data")
+            unwrapped = self._unwrap_dict_segment(item)
+            if str(unwrapped.get("type") or "").strip() == "file":
+                uri = self._extract_media_uri(unwrapped)
+                data = unwrapped.get("data")
                 file_name = str(data.get("name") or "file").strip() if isinstance(data, Mapping) else "file"
                 if uri:
                     file_uploads.append((uri, file_name or "file"))
             else:
-                normal_items.append(dict(item))
+                normal_items.append(dict(unwrapped))
         return normal_items, file_uploads
+
+    @staticmethod
+    def _unwrap_dict_segment(item: Mapping[str, Any]) -> Mapping[str, Any]:
+        """解包宿主 ``send.custom`` 生成的 ``{"type": "dict", "data": {"type": ...}}`` 结构。"""
+        if str(item.get("type") or "").strip() == "dict":
+            inner = item.get("data")
+            if isinstance(inner, Mapping) and str(inner.get("type") or "").strip() in {
+                "file", "video", "image", "voice", "face", "reply", "at"
+            }:
+                return inner
+        return item
 
     def encode_outbound_segments(self, raw_message: Any) -> List[OutgoingSegment]:
         """将 MaiBot 出站 ``raw_message`` 转换为 ``milky.models.OutgoingSegment`` 列表。"""
@@ -442,23 +537,24 @@ class MilkyCodec:
         for item in raw_message:
             if not isinstance(item, Mapping):
                 continue
-            seg_type = str(item.get("type") or "").strip()
-            if seg_type == "file":
+            unwrapped = self._unwrap_dict_segment(item)
+            seg_type = str(unwrapped.get("type") or "").strip()
+            if seg_type in {"file", "reply"} and seg_type == "file":
                 continue
-            built = self._encode_single_segment(seg_type, item)
+            built = self._encode_single_segment(seg_type, unwrapped)
             if built is not None:
                 segments.append(built)
 
         if not segments:
             segments.append(OutgoingTextSegment(data=TextSegmentData(text="")))
         return segments
+
     def _encode_single_segment(self, seg_type: str, item: Mapping[str, Any]) -> Optional[OutgoingSegment]:
         data = item.get("data")
 
         if seg_type == "text":
             text_val = str(data if data is not None else "")
             return OutgoingTextSegment(data=TextSegmentData(text=text_val)) if text_val else None
-
         if seg_type == "at":
             target_uid = ""
             if isinstance(data, Mapping):
@@ -595,9 +691,11 @@ class MilkyCodec:
         elif event_type in {EventType.GROUP_FILE_UPLOAD.value, EventType.FRIEND_FILE_UPLOAD.value}:
             if not notice_cfg.enable_group_file_upload:
                 return None, ""
-            file_name = event_data.get("file_name") or "文件"
-            text = f"[文件上传] 用户 {sender_id} 上传了文件 {file_name}"
-        elif event_type in {EventType.GROUP_MEMBER_INCREASE.value, EventType.GROUP_MEMBER_DECREASE.value}:
+            file_name = str(event_data.get("file_name") or "附件").strip()
+            file_size = event_data.get("file_size") or 0
+            text = f"[事件-文件上传] 用户 {sender_id} 上传了文件 {file_name}"
+            if file_size:
+                text += f"，大小 {file_size}"
             if not notice_cfg.enable_group_member_change:
                 return None, ""
             label = "加入" if event_type == EventType.GROUP_MEMBER_INCREASE.value else "离开"
@@ -640,6 +738,23 @@ class MilkyCodec:
         if group_id:
             message_info["group_info"] = {"group_id": group_id, "group_name": f"group_{group_id}"}
 
+        raw_segments: List[Dict[str, Any]] = [{"type": "text", "data": text}]
+        if event_type in {EventType.GROUP_FILE_UPLOAD.value, EventType.FRIEND_FILE_UPLOAD.value}:
+            file_id = str(event_data.get("file_id") or "").strip()
+            file_hash = str(event_data.get("file_hash") or "").strip()
+            if file_id:
+                if event_type == EventType.FRIEND_FILE_UPLOAD.value and file_hash:
+                    self.remember_private_file_hash(sender_id, file_id, file_hash)
+                raw_segments.append({
+                    "type": "file",
+                    "data": {
+                        "name": str(event_data.get("file_name") or "附件"),
+                        "size": event_data.get("file_size") or 0,
+                        "file_id": file_id,
+                        "busid": 0,
+                    },
+                })
+
         msg_id = f"milky-notice-{uuid4().hex[:12]}"
         return {
             "message_id": msg_id,
@@ -648,7 +763,7 @@ class MilkyCodec:
             "account_id": account_id,
             "scope": scope or None,
             "message_info": message_info,
-            "raw_message": [{"type": "text", "data": text}],
+            "raw_message": raw_segments,
             "processed_plain_text": text,
             "display_message": text,
             "is_mentioned": False,

@@ -10,16 +10,19 @@
   - 支持文本、`@`、全体 `@`、QQ 原生表情、回复引用、图片、动画表情、语音、视频、文件、合并转发的双向转换。
   - 遵循 Milky 联合类型兼容性规范：遇到未来协议新增的未知消息段子类型自动安全降级为可读文本段，不中断消息流。
   - 严格遵循 MaiBot 1.4+ 消息归属规范（顶层 `platform` / `account_id` / `scope`）。
-- **统一头像接口**：实现公开 API `adapter.avatar.get`（version `1`），无缝支持 MaiBot 宿主与 WebUI 的用户/群头像按需加载与缓存。
-- **内置 LLM 群管与交互工具 (`@Tool`)**：
-  - `set_mute`：群成员禁言 / 解除禁言（带时长约束与管理员保护名单）。
-  - `recall_message`：撤回群聊或私聊消息。
-  - `kick_member`：将成员移出群聊。
+- **宿主标准接口全覆盖**：
+  - `adapter.avatar.get`（version `1`, `public=True`）：无缝支持 MaiBot 宿主与 WebUI 的用户/群头像按需加载与缓存。
+  - `adapter.files.resolve`（version `1`, `public=False`）：对接 MaiBot `FileService`，为入站群文件与私聊文件提供按需下载直链解析。
+  - 出站回执 `message_id_echo`：完整回传平台真实消息 ID，保障后续引用回复与撤回链路。
+- **内置 LLM 群管与交互工具 (`@Tool`，对齐官方 OneBot 适配器标准命名与签名)**：
+  - `open_private_chat` & `get_qq_by_msg_id`：主动发起私聊会话、按消息 ID 查询发送者 QQ 号。
   - `send_poke`：群聊 / 私聊戳一戳（Nudge）。
-  - `react_message`：群消息贴表情回应（Reaction）。
-  - `send_private_message`：主动发起私聊会话并发送消息。
+  - `recall_message`：撤回群聊或私聊消息。
+  - `set_mute`：群成员禁言 / 解除禁言（含群主/管理员角色预检、时长约束与保护名单）。
+  - `kick_member`：将成员移出群聊。
+  - `react_emoji`：群消息贴表情表态（Reaction）。
+  - `list_chat_streams` & `forward_messages`：查询活跃聊天流并打包发送合并转发消息。
 - **公开插件 RPC 接口 (`@API`)**：提供 `adapter.milky.*` 系列接口供其他插件调用。
-
 ## 配置说明
 
 插件首次加载时会自动生成 `config.toml`，也可直接在 MaiBot WebUI「插件配置」页面可视化配置：
@@ -39,13 +42,13 @@ action_timeout_sec = 30.0
 connection_id = ""       # 多链路路由 scope，单链路留空
 
 [chat_abilities]
+enable_private_chat_tool = false
 enable_poke_tool = false
 enable_recall_tool = false
 enable_mute_tool = false
 enable_kick_tool = false
-enable_reaction_tool = false
-enable_private_chat_tool = false
-
+enable_emoji_like_tool = false
+enable_forward_tool = false
 [mute]
 admin_users = []
 allowed_groups = []

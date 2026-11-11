@@ -105,35 +105,40 @@ class MilkyChatAbilitiesSection(PluginConfigBase):
     __ui_icon__: ClassVar[str] = "build"
     __ui_order__: ClassVar[int] = 2
 
+    enable_private_chat_tool: bool = Field(
+        default=False,
+        description="启用主动私聊工具（open_private_chat / get_qq_by_msg_id）",
+        json_schema_extra={"label": "启用主动私聊工具", "order": 0},
+    )
     enable_poke_tool: bool = Field(
         default=False,
         description="启用戳一戳工具（send_poke）",
-        json_schema_extra={"label": "启用戳一戳工具", "order": 0},
+        json_schema_extra={"label": "启用戳一戳工具", "order": 1},
     )
     enable_recall_tool: bool = Field(
         default=False,
         description="启用撤回消息工具（recall_message）",
-        json_schema_extra={"label": "启用撤回工具", "order": 1},
+        json_schema_extra={"label": "启用撤回工具", "order": 2},
     )
     enable_mute_tool: bool = Field(
         default=False,
         description="启用群禁言工具（set_mute）",
-        json_schema_extra={"label": "启用禁言工具", "order": 2},
+        json_schema_extra={"label": "启用禁言工具", "order": 3},
     )
     enable_kick_tool: bool = Field(
         default=False,
         description="启用群踢人工具（kick_member）",
-        json_schema_extra={"label": "启用踢人工具", "order": 3},
+        json_schema_extra={"label": "启用踢人工具", "order": 4},
     )
-    enable_reaction_tool: bool = Field(
+    enable_emoji_like_tool: bool = Field(
         default=False,
-        description="启用群消息表情回应工具（react_message）",
-        json_schema_extra={"label": "启用表情表态工具", "order": 4},
+        description="启用群消息表情表态工具（react_emoji）",
+        json_schema_extra={"label": "启用表情表态工具", "order": 5},
     )
-    enable_private_chat_tool: bool = Field(
+    enable_forward_tool: bool = Field(
         default=False,
-        description="启用主动发起私聊工具（send_private_message）",
-        json_schema_extra={"label": "启用主动私聊工具", "order": 5},
+        description="启用合并转发工具（list_chat_streams / forward_messages）",
+        json_schema_extra={"label": "启用合并转发工具", "order": 6},
     )
 
 

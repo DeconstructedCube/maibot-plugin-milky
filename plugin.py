@@ -35,8 +35,11 @@ SET_MUTE_TOOL = "set_mute"
 RECALL_TOOL = "recall_message"
 KICK_TOOL = "kick_member"
 POKE_TOOL = "send_poke"
-REACT_TOOL = "react_message"
-PRIVATE_CHAT_TOOL = "send_private_message"
+REACT_TOOL = "react_emoji"
+OPEN_PRIVATE_CHAT_TOOL = "open_private_chat"
+GET_QQ_BY_MSG_ID_TOOL = "get_qq_by_msg_id"
+LIST_CHAT_STREAMS_TOOL = "list_chat_streams"
+FORWARD_MESSAGES_TOOL = "forward_messages"
 
 
 class MilkyAdapterPlugin(MaiBotPlugin):
@@ -87,7 +90,7 @@ class MilkyAdapterPlugin(MaiBotPlugin):
                 self._start()
 
     async def on_load(self) -> None:
-        self._codec = MilkyCodec(self.ctx.logger)
+        self._codec = MilkyCodec(self._get_logger())
         await self._sync_tool_states()
         if self.config.plugin.enabled:
             self._start()
@@ -141,12 +144,15 @@ class MilkyAdapterPlugin(MaiBotPlugin):
     async def _sync_tool_states(self) -> None:
         abilities = self.config.chat_abilities
         tool_switches = (
+            (OPEN_PRIVATE_CHAT_TOOL, abilities.enable_private_chat_tool),
+            (GET_QQ_BY_MSG_ID_TOOL, abilities.enable_private_chat_tool),
             (POKE_TOOL, abilities.enable_poke_tool),
             (RECALL_TOOL, abilities.enable_recall_tool),
             (SET_MUTE_TOOL, abilities.enable_mute_tool),
             (KICK_TOOL, abilities.enable_kick_tool),
-            (REACT_TOOL, abilities.enable_reaction_tool),
-            (PRIVATE_CHAT_TOOL, abilities.enable_private_chat_tool),
+            (REACT_TOOL, abilities.enable_emoji_like_tool),
+            (LIST_CHAT_STREAMS_TOOL, abilities.enable_forward_tool),
+            (FORWARD_MESSAGES_TOOL, abilities.enable_forward_tool),
         )
         for tool_name, enabled in tool_switches:
             comp_name = f"{self.ctx.plugin_id}.{tool_name}"
@@ -155,7 +161,6 @@ class MilkyAdapterPlugin(MaiBotPlugin):
                     await self.ctx.component.enable_component(comp_name, "TOOL")
                 else:
                     await self.ctx.component.disable_component(comp_name, "TOOL")
-
     async def _set_ready(self, ready: bool) -> None:
         if not ready and not self._ready:
             return
@@ -184,7 +189,7 @@ class MilkyAdapterPlugin(MaiBotPlugin):
 
     def _require_codec(self) -> MilkyCodec:
         if self._codec is None:
-            self._codec = MilkyCodec(self.ctx.logger)
+            self._codec = MilkyCodec(self._get_logger())
         return self._codec
 
     async def _connection_loop(self) -> None:
@@ -353,11 +358,16 @@ class MilkyAdapterPlugin(MaiBotPlugin):
             add_cfg = msg_info.get("additional_config")
             add_cfg = add_cfg if isinstance(add_cfg, Mapping) else {}
 
+            internal_message_id = str(message.get("message_id") or "").strip()
             raw_segments = message.get("raw_message", [])
             normal_items, file_uploads = codec.extract_outbound_files(raw_segments)
 
             group_id_str = str(
-                group_info.get("group_id") or add_cfg.get("platform_io_target_group_id") or ""
+                group_info.get("group_id")
+                or add_cfg.get("platform_io_target_group_id")
+                or route_dict.get("group_id")
+                or route_dict.get("target_group_id")
+                or ""
             ).strip()
             if group_id_str:
                 group_id = int(group_id_str)
@@ -372,6 +382,7 @@ class MilkyAdapterPlugin(MaiBotPlugin):
                     up_res = await client.upload_group_file(group_id, file_uri, file_name)
                     if not ext_id:
                         ext_id = f"milky-group-file-{group_id}-{up_res.file_id}"
+                meta["adapter_callbacks"] = self._build_echo_callbacks(internal_message_id, ext_id)
                 return {
                     "success": True,
                     "external_message_id": ext_id or None,
@@ -381,6 +392,7 @@ class MilkyAdapterPlugin(MaiBotPlugin):
             user_id_str = str(
                 add_cfg.get("platform_io_target_user_id")
                 or add_cfg.get("target_user_id")
+                or route_dict.get("user_id")
                 or route_dict.get("target_user_id")
                 or ""
             ).strip()
@@ -399,6 +411,7 @@ class MilkyAdapterPlugin(MaiBotPlugin):
                 up_res = await client.upload_private_file(user_id, file_uri, file_name)
                 if not ext_id:
                     ext_id = f"milky-private-file-{user_id}-{up_res.file_id}"
+            meta["adapter_callbacks"] = self._build_echo_callbacks(internal_message_id, ext_id)
             return {
                 "success": True,
                 "external_message_id": ext_id or None,
@@ -410,6 +423,26 @@ class MilkyAdapterPlugin(MaiBotPlugin):
 
     # =========================================================================
     # 统一头像协议 API
+    # =========================================================================
+    @staticmethod
+    def _build_echo_callbacks(internal_message_id: str, external_message_id: str) -> List[Dict[str, Any]]:
+        if internal_message_id and external_message_id and internal_message_id != external_message_id:
+            return [
+                {
+                    "name": "message_id_echo",
+                    "payload": {
+                        "content": {
+                            "type": "echo",
+                            "echo": internal_message_id,
+                            "actual_id": external_message_id,
+                        }
+                    },
+                }
+            ]
+        return []
+
+    # =========================================================================
+    # MaiBot 宿主标准接口：统一头像协议与文件服务解析协议
     # =========================================================================
 
     @API("adapter.avatar.get", description="获取 QQ 用户或群头像资源", version="1", public=True)
@@ -435,6 +468,30 @@ class MilkyAdapterPlugin(MaiBotPlugin):
             else f"https://q1.qlogo.cn/g?b=qq&nk={normalized_id}&s=640"
         )
         return {"status": "available", "url": url, "expires_in": AVATAR_TTL_SEC}
+
+    @API("adapter.files.resolve", description="为主程序文件服务解析已登记附件的下载地址", version="1", public=False)
+    async def api_resolve_file(self, source: Dict[str, Any]) -> Dict[str, Any]:
+        """供 MaiBot FileService.resolve_url 调用，返回平台文件短期下载直链。"""
+        if not isinstance(source, Mapping) or source.get("platform") != PLATFORM or not source.get("file_id"):
+            raise ValueError("文件来源无效")
+        client = self._require_client()
+        codec = self._require_codec()
+        file_id = str(source["file_id"]).strip()
+        group_id = str(source.get("group_id") or "").strip()
+        if group_id and group_id.isdigit():
+            res = await client.get_group_file_download_url(int(group_id), file_id)
+            if not res.download_url:
+                raise RuntimeError("Milky 协议端未返回群文件下载 URL")
+            return {"url": res.download_url}
+
+        user_id = str(source.get("user_id") or "").strip()
+        if not user_id or not user_id.isdigit():
+            raise ValueError("私聊文件缺少有效的 user_id")
+        file_hash = str(source.get("file_hash") or codec.private_file_hashes.get((user_id, file_id)) or "").strip()
+        res = await client.get_private_file_download_url(int(user_id), file_id, file_hash)
+        if not res.download_url:
+            raise RuntimeError("Milky 协议端未返回私聊文件下载 URL")
+        return {"url": res.download_url}
 
     # =========================================================================
     # LLM 群管与交互工具 (@Tool)
@@ -462,7 +519,6 @@ class MilkyAdapterPlugin(MaiBotPlugin):
         _, _, parsed_seq = parse_milky_message_id(str(query_res.get("message_id") or msg_id))
         seq = int(seq_raw) if isinstance(seq_raw, int) else parsed_seq
         return msg_info, group_id, sender_id, seq
-
     @Tool(
         SET_MUTE_TOOL,
         platforms=PLATFORM,
@@ -472,6 +528,8 @@ class MilkyAdapterPlugin(MaiBotPlugin):
             ToolParameterInfo(name="duration", param_type=ToolParamType.INTEGER, description="禁言秒数；0 为解除禁言", required=True),
             ToolParameterInfo(name="reason", param_type=ToolParamType.STRING, description="禁言原因（可选）", required=False, default=""),
         ],
+        enabled=False,
+        visibility="visible",
     )
     async def tool_set_mute(self, msg_id: str, duration: int, reason: str = "", **kwargs: Any) -> Dict[str, Any]:
         if not self.config.chat_abilities.enable_mute_tool:
@@ -487,9 +545,15 @@ class MilkyAdapterPlugin(MaiBotPlugin):
                 return {"success": False, "error": f"群 {group_id} 不在允许群管白名单中"}
             if duration > 0 and target_uid in mute_cfg.admin_users:
                 return {"success": False, "error": f"用户 {target_uid} 在保护名单中，不可禁言"}
+            if duration > 0:
+                with suppress(Exception):
+                    member_info = await client.get_group_member_info(int(group_id), int(target_uid), no_cache=True)
+                    if member_info.role.value in {"owner", "admin"}:
+                        role_label = "群主" if member_info.role.value == "owner" else "管理员"
+                        return {"success": False, "error": f"目标用户是{role_label}，不能被禁言"}
             effective_duration = 0 if duration <= 0 else max(mute_cfg.min_duration, min(int(duration), mute_cfg.max_duration))
             await client.set_group_member_mute(int(group_id), int(target_uid), effective_duration)
-            action_text = f"已解除用户 {target_uid} 的禁言" if effective_duration == 0 else f"已将用户 {target_uid} 禁言 {effective_duration} 秒"
+            action_text = f"已解除用户 {target_uid} 的禁言。" if effective_duration == 0 else f"已将用户 {target_uid} 禁言 {effective_duration} 秒。"
             return {"success": True, "content": action_text, "group_id": group_id, "user_id": target_uid, "duration": effective_duration, "reason": reason}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
@@ -499,23 +563,28 @@ class MilkyAdapterPlugin(MaiBotPlugin):
         platforms=PLATFORM,
         description="撤回一条 QQ 群聊或私聊消息。msg_id 使用聊天记录中的消息 ID。",
         parameters=[
-            ToolParameterInfo(name="msg_id", param_type=ToolParamType.STRING, description="要撤回的消息 ID", required=True),
+            ToolParameterInfo(name="msg_id", param_type=ToolParamType.STRING, description="要撤回的消息 ID，来自聊天记录中的消息 ID", required=True),
         ],
+        enabled=False,
+        visibility="visible",
     )
-    async def tool_recall_message(self, msg_id: str, **kwargs: Any) -> Dict[str, Any]:
+    async def tool_recall_message(self, msg_id: str = "", **kwargs: Any) -> Dict[str, Any]:
         if not self.config.chat_abilities.enable_recall_tool:
             return {"success": False, "error": "撤回工具未启用"}
         try:
             client = self._require_client()
+            target_mid = str(msg_id or kwargs.get("message_id") or "").strip()
             stream_id = str(kwargs.get("stream_id") or "")
-            _, group_id, sender_id, seq = await self._resolve_message_context(msg_id.strip(), stream_id)
+            _, group_id, sender_id, seq = await self._resolve_message_context(target_mid, stream_id)
             if seq is None:
-                _, parsed_peer, parsed_seq = parse_milky_message_id(msg_id.strip())
+                parsed_scene, parsed_peer, parsed_seq = parse_milky_message_id(target_mid)
                 seq = parsed_seq
-                if not group_id and parsed_peer is not None:
+                if parsed_scene == "group" and not group_id and parsed_peer is not None:
                     group_id = str(parsed_peer)
+                elif parsed_scene != "group" and not sender_id and parsed_peer is not None:
+                    sender_id = str(parsed_peer)
             if seq is None:
-                return {"success": False, "error": f"无法解析消息 {msg_id} 的 Milky message_seq"}
+                return {"success": False, "error": f"无法解析消息 {target_mid} 的 Milky message_seq"}
             if group_id:
                 if self.config.mute.allowed_groups and group_id not in self.config.mute.allowed_groups:
                     return {"success": False, "error": f"群 {group_id} 不在允许白名单中"}
@@ -524,7 +593,7 @@ class MilkyAdapterPlugin(MaiBotPlugin):
                 await client.recall_private_message(int(sender_id), seq)
             else:
                 return {"success": False, "error": "无法定位消息所属会话"}
-            return {"success": True, "content": f"已撤回消息 {msg_id} (seq={seq})"}
+            return {"success": True, "content": f"已撤回消息 {target_mid} (seq={seq})。"}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
@@ -536,6 +605,8 @@ class MilkyAdapterPlugin(MaiBotPlugin):
             ToolParameterInfo(name="msg_id", param_type=ToolParamType.STRING, description="目标成员发过的消息 ID", required=True),
             ToolParameterInfo(name="reason", param_type=ToolParamType.STRING, description="移出原因（可选）", required=False, default=""),
         ],
+        enabled=False,
+        visibility="visible",
     )
     async def tool_kick_member(self, msg_id: str, reason: str = "", **kwargs: Any) -> Dict[str, Any]:
         if not self.config.chat_abilities.enable_kick_tool:
@@ -551,95 +622,240 @@ class MilkyAdapterPlugin(MaiBotPlugin):
             if target_uid in self.config.mute.admin_users or target_uid == self._account_id:
                 return {"success": False, "error": f"用户 {target_uid} 在保护名单中或为机器人自身"}
             await client.kick_group_member(int(group_id), int(target_uid), reject_add_request=False)
-            return {"success": True, "content": f"已将成员 {target_uid} 移出群 {group_id}", "reason": reason}
+            return {"success": True, "content": f"已将成员 {target_uid} 移出群 {group_id}。", "reason": reason}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
     @Tool(
         POKE_TOOL,
         platforms=PLATFORM,
-        description="发送 QQ 戳一戳（拍一拍）。可传入 msg_id 戳该消息发送者，或直接指定 user_id。",
+        description="对指定消息的发送者发送 QQ 戳一戳。",
         parameters=[
-            ToolParameterInfo(name="user_id", param_type=ToolParamType.STRING, description="目标用户 QQ 号（可选，不填则从 msg_id 解析）", required=False, default=""),
-            ToolParameterInfo(name="msg_id", param_type=ToolParamType.STRING, description="目标用户发过的消息 ID（可选）", required=False, default=""),
+            ToolParameterInfo(name="msg_id", param_type=ToolParamType.STRING, description="目标用户发送的消息 ID，戳一戳对象是该消息的发送者", required=True),
         ],
+        enabled=False,
+        visibility="visible",
     )
-    async def tool_send_poke(self, user_id: str = "", msg_id: str = "", **kwargs: Any) -> Dict[str, Any]:
+    async def tool_send_poke(self, msg_id: str = "", **kwargs: Any) -> Dict[str, Any]:
         if not self.config.chat_abilities.enable_poke_tool:
             return {"success": False, "error": "戳一戳工具未启用"}
         try:
             client = self._require_client()
-            group_id = str(kwargs.get("group_id") or "").strip()
-            target_uid = str(user_id or "").strip()
-            if msg_id.strip():
-                _, resolved_group, resolved_uid, _ = await self._resolve_message_context(
-                    msg_id.strip(), str(kwargs.get("stream_id") or "")
-                )
-                group_id = group_id or resolved_group
-                target_uid = target_uid or resolved_uid
-            if not target_uid:
-                target_uid = str(kwargs.get("user_id") or "").strip()
-            if not target_uid.isdigit():
-                return {"success": False, "error": "缺少有效的目标用户 QQ 号"}
+            stream_id = str(kwargs.get("stream_id") or "")
+            _, group_id, target_uid, _ = await self._resolve_message_context(msg_id.strip(), stream_id)
+            if not target_uid or not target_uid.isdigit():
+                return {"success": False, "error": f"未找到消息 {msg_id} 或其缺少有效发送者 QQ 号"}
             if group_id and group_id.isdigit():
                 await client.send_group_nudge(int(group_id), int(target_uid))
+                scope_text = f"群 {group_id} 中"
             else:
                 await client.send_friend_nudge(int(target_uid))
-            return {"success": True, "content": f"已戳一戳用户 {target_uid}"}
+                scope_text = "私聊中"
+            return {"success": True, "content": f"已在{scope_text}向 {target_uid} 发送戳一戳。", "user_id": target_uid, "group_id": group_id}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
     @Tool(
         REACT_TOOL,
         platforms=PLATFORM,
-        description="对当前 QQ 群聊中的指定消息贴表情表态（reaction）。",
+        chat_scope="group",
+        description="给一条群聊消息贴表情表态（消息回应），如点赞、爱心等。常用表情 ID：76=赞、66=爱心、63=玫瑰、21=可爱、5=流泪、78=握手、144=喝彩、424=续标识。",
         parameters=[
-            ToolParameterInfo(name="msg_id", param_type=ToolParamType.STRING, description="目标消息 ID", required=True),
-            ToolParameterInfo(name="reaction", param_type=ToolParamType.STRING, description="QQ 表情 ID（如 '76' 为赞）", required=True),
-            ToolParameterInfo(name="is_add", param_type=ToolParamType.BOOLEAN, description="True 添加回应，False 取消回应", required=False, default=True),
+            ToolParameterInfo(name="message_id", param_type=ToolParamType.STRING, description="要贴表情的消息 ID，来自聊天记录中的消息 ID", required=True),
+            ToolParameterInfo(name="emoji_id", param_type=ToolParamType.INTEGER, description="QQ 表情 ID，如 76 表示赞", required=True),
         ],
+        enabled=False,
+        visibility="visible",
     )
-    async def tool_react_message(self, msg_id: str, reaction: str, is_add: bool = True, **kwargs: Any) -> Dict[str, Any]:
-        if not self.config.chat_abilities.enable_reaction_tool:
+    async def tool_react_emoji(self, message_id: str = "", emoji_id: int = 76, **kwargs: Any) -> Dict[str, Any]:
+        if not self.config.chat_abilities.enable_emoji_like_tool:
             return {"success": False, "error": "表情表态工具未启用"}
         try:
             client = self._require_client()
+            target_mid = str(message_id or kwargs.get("msg_id") or "").strip()
             stream_id = str(kwargs.get("stream_id") or "")
-            _, group_id, _, seq = await self._resolve_message_context(msg_id.strip(), stream_id)
+            _, group_id, _, seq = await self._resolve_message_context(target_mid, stream_id)
+            if seq is None:
+                _, parsed_peer, parsed_seq = parse_milky_message_id(target_mid)
+                seq = parsed_seq
+                if not group_id and parsed_peer is not None:
+                    group_id = str(parsed_peer)
             if not group_id or seq is None:
                 return {"success": False, "error": "仅支持对有效的群聊消息添加表情回应"}
-            await client.send_group_message_reaction(int(group_id), seq, reaction.strip(), is_add=is_add)
-            return {"success": True, "content": f"已对消息 {msg_id} {'添加' if is_add else '取消'}表情回应 {reaction}"}
+            await client.send_group_message_reaction(int(group_id), seq, str(int(emoji_id)), is_add=True)
+            return {"success": True, "content": f"已对消息 {target_mid} 贴上 [表情{emoji_id}] 回应。", "message_id": target_mid, "emoji_id": int(emoji_id)}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
     @Tool(
-        PRIVATE_CHAT_TOOL,
+        OPEN_PRIVATE_CHAT_TOOL,
         platforms=PLATFORM,
-        description="主动向指定 QQ 号发送私聊消息。",
+        description="向指定 QQ 用户发送一条私聊消息，用于主动开启私聊。",
         parameters=[
-            ToolParameterInfo(name="user_id", param_type=ToolParamType.STRING, description="目标用户 QQ 号", required=True),
-            ToolParameterInfo(name="content", param_type=ToolParamType.STRING, description="要发送的私聊文本内容", required=True),
+            ToolParameterInfo(name="user_id", param_type=ToolParamType.STRING, description="要开启私聊的 QQ 用户 ID，必须是正整数", required=True),
+            ToolParameterInfo(name="message", param_type=ToolParamType.STRING, description="要发送给该用户的第一条私聊消息", required=True),
         ],
+        enabled=False,
+        visibility="visible",
     )
-    async def tool_send_private_message(self, user_id: str, content: str, **kwargs: Any) -> Dict[str, Any]:
+    async def tool_open_private_chat(self, user_id: str = "", message: str = "", **kwargs: Any) -> Dict[str, Any]:
         del kwargs
         if not self.config.chat_abilities.enable_private_chat_tool:
             return {"success": False, "error": "主动私聊工具未启用"}
         try:
             uid = str(user_id or "").strip()
-            text = str(content or "").strip()
+            text = str(message or "").strip()
             if not uid.isdigit() or not text:
                 return {"success": False, "error": "必须提供有效的数字 QQ 号与非空消息内容"}
-            opened = await self.ctx.chat.open_session(platform=PLATFORM, chat_type="private", user_id=uid)
-            stream_id = str(opened.get("stream_id") or opened.get("session_id") or "").strip() if isinstance(opened, Mapping) else ""
-            if stream_id:
-                await self.ctx.send.text(text, stream_id)
-                return {"success": True, "content": f"已向用户 {uid} 发送私聊消息"}
+            opened = await self.ctx.chat.open_session(
+                platform=PLATFORM,
+                chat_type="private",
+                user_id=uid,
+                account_id=self._account_id,
+                scope=self.config.client.normalized_scope,
+            )
+            stream_id = str(opened.get("session_id") or opened.get("stream_id") or "").strip() if isinstance(opened, Mapping) else ""
             client = self._require_client()
             codec = self._require_codec()
             res = await client.send_private_message(int(uid), codec.encode_outbound_segments([{"type": "text", "data": text}]))
-            return {"success": True, "content": f"已向用户 {uid} 发送私聊消息 (seq={res.message_seq})"}
+            return {
+                "success": True,
+                "content": f"已向用户 {uid} 发送私聊消息。请确认宿主适配器策略允许该私聊的入站消息。",
+                "user_id": uid,
+                "stream_id": stream_id,
+                "message_id": build_message_id("friend", uid, res.message_seq),
+            }
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    @Tool(
+        GET_QQ_BY_MSG_ID_TOOL,
+        platforms=PLATFORM,
+        description="根据当前聊天中的消息 ID 获取该消息发送者的 QQ 用户 ID。",
+        parameters=[
+            ToolParameterInfo(name="msg_id", param_type=ToolParamType.STRING, description="目标用户发送的消息 ID", required=True),
+        ],
+        enabled=False,
+        visibility="visible",
+    )
+    async def tool_get_qq_by_msg_id(self, msg_id: str = "", stream_id: str = "", **kwargs: Any) -> Dict[str, Any]:
+        del kwargs
+        normalized_mid = str(msg_id or "").strip()
+        if not normalized_mid:
+            return {"success": False, "error": "缺少目标消息 ID"}
+        msg_info, group_id, sender_id, _ = await self._resolve_message_context(normalized_mid, stream_id)
+        if msg_info is None or not sender_id:
+            return {"success": False, "error": f"未找到消息 {normalized_mid} 或其缺少发送者 QQ 号"}
+        user_info = msg_info.get("user_info", {})
+        user_info = user_info if isinstance(user_info, Mapping) else {}
+        nickname = str(user_info.get("user_nickname") or "").strip()
+        cardname = str(user_info.get("user_cardname") or "").strip()
+        display_name = cardname or nickname or sender_id
+        return {
+            "success": True,
+            "content": f"消息 {normalized_mid} 的发送者是 {display_name}，QQ 号为 {sender_id}。",
+            "msg_id": normalized_mid,
+            "user_id": sender_id,
+            "qq": sender_id,
+            "display_name": display_name,
+            "group_id": group_id,
+        }
+
+    @Tool(
+        LIST_CHAT_STREAMS_TOOL,
+        platforms=PLATFORM,
+        description="列出当前所有活跃的 QQ 聊天流（群聊和私聊），返回每个流的显示名称、类型、群号或用户 QQ 号。",
+        parameters=[],
+        enabled=False,
+        visibility="visible",
+    )
+    async def tool_list_chat_streams(self, **kwargs: Any) -> Dict[str, Any]:
+        del kwargs
+        streams = await self.ctx.chat.get_all_streams(platform=PLATFORM)
+        if not isinstance(streams, list):
+            return {"success": False, "error": "获取聊天流列表失败"}
+        entries: List[Dict[str, Any]] = []
+        lines: List[str] = []
+        for idx, stream in enumerate(streams, start=1):
+            if not isinstance(stream, Mapping):
+                continue
+            group_id = str(stream.get("group_id") or "").strip()
+            user_id = str(stream.get("user_id") or "").strip()
+            is_group = bool(stream.get("is_group_session"))
+            if is_group and group_id:
+                name = str(stream.get("group_name") or "").strip() or f"群 {group_id}"
+                entries.append({"display_name": name, "chat_type": "group", "group_id": group_id, "user_id": ""})
+                lines.append(f"{idx}. [群聊] {name}（群号 {group_id}）")
+            elif user_id:
+                peer_name = str(stream.get("user_cardname") or stream.get("user_nickname") or "").strip()
+                name = f"{peer_name}的私聊" if peer_name else f"QQ {user_id} 的私聊"
+                entries.append({"display_name": name, "chat_type": "private", "group_id": "", "user_id": user_id})
+                lines.append(f"{idx}. [私聊] {name}（QQ {user_id}）")
+        if not entries:
+            return {"success": True, "content": "当前没有活跃的聊天流。", "streams": [], "count": 0}
+        return {"success": True, "content": f"当前活跃聊天流共 {len(entries)} 个：\n" + "\n".join(lines), "streams": entries, "count": len(entries)}
+
+    @Tool(
+        FORWARD_MESSAGES_TOOL,
+        platforms=PLATFORM,
+        description="把一批消息打包成合并转发消息，发送到指定的群或私聊。目标群号或用户 QQ 号可先用 list_chat_streams 查询。",
+        parameters=[
+            ToolParameterInfo(
+                name="message_ids",
+                param_type=ToolParamType.ARRAY,
+                description="要转发的消息 ID 列表，按顺序排列",
+                required=True,
+                items_schema={"type": "string", "description": "聊天记录中的消息 ID"},
+            ),
+            ToolParameterInfo(name="target_group_id", param_type=ToolParamType.STRING, description="目标群号；与 target_user_id 二选一", required=False, default=""),
+            ToolParameterInfo(name="target_user_id", param_type=ToolParamType.STRING, description="目标私聊用户 QQ 号；与 target_group_id 二选一", required=False, default=""),
+        ],
+        enabled=False,
+        visibility="visible",
+    )
+    async def tool_forward_messages(
+        self,
+        message_ids: Optional[List[str]] = None,
+        target_group_id: str = "",
+        target_user_id: str = "",
+        stream_id: str = "",
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        del kwargs
+        if not self.config.chat_abilities.enable_forward_tool:
+            return {"success": False, "error": "合并转发工具未启用"}
+        if not isinstance(message_ids, list) or not message_ids:
+            return {"success": False, "error": "message_ids 必须是非空列表"}
+        group_id_str = str(target_group_id or "").strip()
+        user_id_str = str(target_user_id or "").strip()
+        if bool(group_id_str) == bool(user_id_str):
+            return {"success": False, "error": "target_group_id 与 target_user_id 必须二选一"}
+        try:
+            client = self._require_client()
+            codec = self._require_codec()
+            forward_nodes: List[Dict[str, Any]] = []
+            for mid in dict.fromkeys(str(m or "").strip() for m in message_ids if str(m or "").strip()):
+                query_res = await self.ctx.message.get_by_id(mid, stream_id=stream_id)
+                if not isinstance(query_res, Mapping):
+                    return {"success": False, "error": f"未找到消息 {mid}"}
+                msg_info = query_res.get("message_info", {})
+                user_info = msg_info.get("user_info", {}) if isinstance(msg_info, Mapping) else {}
+                raw_msg = query_res.get("raw_message")
+                if not isinstance(raw_msg, list):
+                    return {"success": False, "error": f"消息 {mid} 内容为空"}
+                forward_nodes.append({
+                    "user_id": str(user_info.get("user_id") or self._account_id or "10000"),
+                    "user_nickname": str(user_info.get("user_nickname") or user_info.get("user_cardname") or "QQ用户"),
+                    "content": raw_msg,
+                })
+            segments = codec.encode_outbound_segments([{"type": "forward", "data": forward_nodes}])
+            if group_id_str:
+                await client.send_group_message(int(group_id_str), segments)
+                target_label = f"群 {group_id_str}"
+            else:
+                await client.send_private_message(int(user_id_str), segments)
+                target_label = f"用户 {user_id_str} 的私聊"
+            return {"success": True, "content": f"已把 {len(forward_nodes)} 条消息打包成合并转发发送到{target_label}。"}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
