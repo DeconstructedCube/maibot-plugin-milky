@@ -696,6 +696,7 @@ class MilkyCodec:
             text = f"[事件-文件上传] 用户 {sender_id} 上传了文件 {file_name}"
             if file_size:
                 text += f"，大小 {file_size}"
+        elif event_type in {EventType.GROUP_MEMBER_INCREASE.value, EventType.GROUP_MEMBER_DECREASE.value}:
             if not notice_cfg.enable_group_member_change:
                 return None, ""
             label = "加入" if event_type == EventType.GROUP_MEMBER_INCREASE.value else "离开"
